@@ -1,0 +1,809 @@
+--[[
+    Hoops — aim line + guided ball trajectory
+    UI: lyap lib (the uilib.txt you dropped)
+    Put the raw lib URL in LIB_URL, or pre-load it and comment the loadstring out.
+]]
+
+local LIB_URL = "PUT_LIB_URL_HERE" -- FILL: your lyap lib raw url
+
+local Library = LIB_URL ~= "PUT_LIB_URL_HERE" and loadstring(game:HttpGet(LIB_URL))() or getgenv().Library
+assert(Library, "Library not loaded — set LIB_URL or pre-load it into getgenv().Library")
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local Workspace = game:GetService("Workspace")
+
+local LocalPlayer = Players.LocalPlayer
+
+-- Runtime config. Everything that lives in the world is named here, nothing buried.
+local Config = {
+    LineColor = Color3.fromRGB(80, 255, 80),
+    LineThickness = 0.25,
+
+    ShotSpeed = 110,       -- studs/s the ball is pulled down the line
+    HeldRange = 4.5,       -- studs: closer than this to any HRP = ball is held
+    ShootRange = 2.0,      -- stop pushing once this close to the rim
+
+    RefreshRate = 0.5,     -- seconds between re-scanning for hoop/ball
+
+    HoopNames = { "rim", "hoop", "net", "backboard", "basket" },
+    BallNames = { "ball", "basketball", "hoopball" },
+
+    -- hoopz world layout: workspace.Courts["Court A".."K"]."Basketball Hoop".hoop
+    CourtsFolder = "Courts",
+    HoopContainer = "Basketball Hoop",
+    HoopChild = "hoop",
+    BallLockRange = 200,   -- studs: don't lock a ball further than this
+
+    -- hoopz ball layout: workspace.Basketball["[GAME]"].CurrentGame -> court
+    BallFolder = "Basketball",
+    BallCourtValue = "CurrentGame",
+
+    -- aimbot
+    ArcHeight = 8.5,       -- studs above the rim the camera locks onto
+    AimRange = 55,         -- only lock when this close to the hoop
+    AimSmooth = 0.5,       -- 0..1 lerp toward the aim rotation (1 = instant snap)
+    PowerTarget = 85,      -- perfect-release power (hoopz green)
+    ReleaseCooldown = 0.35,-- min seconds between auto releases
+}
+
+local State = {
+    DrawLine = false,
+    FollowLine = false,
+    Aimbot = false,
+    AutoRelease = false,
+    LastRelease = nil,
+    Hoop = nil,          -- BasePart (nearest court's hoop)
+    Ball = nil,          -- BasePart (active/main ball)
+    Court = nil,         -- Model/Folder of the court the player is on
+    LockedBall = nil,    -- BasePart (main ball, held until court changes)
+    LockedCourt = nil,   -- court the main ball was chosen on
+}
+
+--------------------------------------------------------------------------------
+-- world discovery
+--------------------------------------------------------------------------------
+
+local function nameMatches(obj, list)
+    local n = obj.Name:lower()
+    for _, kw in ipairs(list) do
+        if n:find(kw, 1, true) then
+            return true
+        end
+    end
+    return false
+end
+
+local function getRoot()
+    local char = LocalPlayer.Character
+    return char and char:FindFirstChild("HumanoidRootPart")
+end
+
+-- nearest BasePart whose name hits a keyword list, relative to the player
+local function findNearest(keywords)
+    local root = getRoot()
+    local origin = root and root.Position or Vector3.new(0, 0, 0)
+
+    local best, bestDist
+    for _, obj in ipairs(Workspace:GetDescendants()) do
+        if obj:IsA("BasePart") and nameMatches(obj, keywords) then
+            local d = (obj.Position - origin).Magnitude
+            if not bestDist or d < bestDist then
+                best, bestDist = obj, d
+            end
+        end
+    end
+    return best
+end
+
+local function isHeld(ball)
+    for _, plr in ipairs(Players:GetPlayers()) do
+        local char = plr.Character
+        local hrp = char and char:FindFirstChild("HumanoidRootPart")
+        if hrp and (ball.Position - hrp.Position).Magnitude < Config.HeldRange then
+            return true
+        end
+    end
+    return false
+end
+
+-- resolve "Basketball Hoop".hoop down to a BasePart, whatever it's wrapped in
+local function resolveHoop(container)
+    local hoop = container:FindFirstChild(Config.HoopChild)
+        or container:FindFirstChild(Config.HoopChild, true)
+    if not hoop then
+        return nil
+    end
+    if hoop:IsA("BasePart") then
+        return hoop
+    end
+    return hoop:FindFirstChildWhichIsA("BasePart")
+end
+
+local function courtHoop(court)
+    local container = court:FindFirstChild(Config.HoopContainer)
+        or court:FindFirstChild(Config.HoopContainer, true)
+    if not container then
+        return nil
+    end
+    return resolveHoop(container)
+end
+
+-- nearest lettered court + its hoop. Falls back to keyword scan if the folder
+-- isn't where we expect.
+local function nearestCourt()
+    local root = getRoot()
+    local origin = root and root.Position or Vector3.new(0, 0, 0)
+
+    local courts = Workspace:FindFirstChild(Config.CourtsFolder)
+    if courts then
+        local bestCourt, bestHoop, bestDist
+        for _, court in ipairs(courts:GetChildren()) do
+            local hoop = courtHoop(court)
+            if hoop then
+                local d = (hoop.Position - origin).Magnitude
+                if not bestDist or d < bestDist then
+                    bestCourt, bestHoop, bestDist = court, hoop, d
+                end
+            end
+        end
+        if bestHoop then
+            return bestCourt, bestHoop
+        end
+    end
+
+    return nil, findNearest(Config.HoopNames)
+end
+
+-- court token -> index. "Court A"/"a" -> 1, "3" -> 3. Lets a lettered
+-- court name line up with a numeric CurrentGame value and vice versa.
+local function courtIndex(token)
+    local s = tostring(token or ""):lower():gsub("court", ""):gsub("%s", "")
+    if s == "" then
+        return nil
+    end
+    local num = tonumber(s) or tonumber(s:match("%d+"))
+    if num then
+        return num
+    end
+    local letter = s:match("%a")
+    if letter then
+        return letter:byte() - ("a"):byte() + 1
+    end
+    return nil
+end
+
+local function ballPartOf(entry)
+    if not entry then
+        return nil
+    end
+    if entry:IsA("BasePart") then
+        return entry
+    end
+    return entry:FindFirstChildWhichIsA("BasePart")
+end
+
+-- every ball in workspace.Basketball, with the court its CurrentGame reports.
+-- Walks the whole folder so it doesn't care how the "[GAME]" entries nest.
+local function folderBalls()
+    local out = {}
+    local folder = Workspace:FindFirstChild(Config.BallFolder)
+    if not folder then
+        return out
+    end
+
+    local seen = {}
+    for _, inst in ipairs(folder:GetDescendants()) do
+        if inst:IsA("ValueBase") and inst.Name == Config.BallCourtValue then
+            local entry = inst.Parent
+            local part = ballPartOf(entry) or ballPartOf(entry.Parent)
+            if part and not seen[part] then
+                seen[part] = true
+                out[#out + 1] = { Part = part, Court = tostring(inst.Value) }
+            end
+        end
+    end
+
+    return out
+end
+
+-- nearest ball the player can use. Prefers balls whose CurrentGame matches the
+-- player's court; falls back to any ball by name.
+local function findNearestBall(courtName)
+    local root = getRoot()
+    local origin = root and root.Position or Vector3.new(0, 0, 0)
+    local want = courtIndex(courtName)
+
+    local best, bestDist
+
+    for _, ball in ipairs(folderBalls()) do
+        local mine = (want == nil) or (courtIndex(ball.Court) == want)
+        if mine then
+            local d = (ball.Part.Position - origin).Magnitude
+            if not bestDist or d < bestDist then
+                best, bestDist = ball.Part, d
+            end
+        end
+    end
+
+    -- fallback: keyword scan anywhere in the world
+    if not best then
+        for _, obj in ipairs(Workspace:GetDescendants()) do
+            if obj:IsA("BasePart") and nameMatches(obj, Config.BallNames) then
+                local d = (obj.Position - origin).Magnitude
+                if not bestDist or d < bestDist then
+                    best, bestDist = obj, d
+                end
+            end
+        end
+    end
+
+    return best, bestDist
+end
+
+-- pick / refresh the main ball. A chosen ball stays main until the player
+-- moves off the court it was picked on (or it vanishes).
+local function refreshBall(court)
+    local locked = State.LockedBall
+    if locked and locked.Parent and State.LockedCourt == court then
+        State.Ball = locked
+        return
+    end
+
+    local ball, dist = findNearestBall(court and court.Name)
+    State.Ball = ball
+
+    if ball and dist and dist <= Config.BallLockRange then
+        State.LockedBall = ball
+        State.LockedCourt = court
+    else
+        State.LockedBall = nil
+        State.LockedCourt = nil
+    end
+end
+
+--------------------------------------------------------------------------------
+-- the line: Beam from player root -> hoop
+--------------------------------------------------------------------------------
+
+local visuals = Instance.new("Folder")
+visuals.Name = "HoopsVisuals"
+visuals.Parent = Workspace
+
+local Line = { Beam = nil, AttachPlayer = nil, AttachHoop = nil }
+
+local function ensureLine()
+    if Line.Beam and Line.Beam.Parent then
+        return
+    end
+
+    local attachA = Instance.new("Attachment")
+    attachA.Name = "HoopsLine_Player"
+
+    local attachB = Instance.new("Attachment")
+    attachB.Name = "HoopsLine_Hoop"
+
+    local beam = Instance.new("Beam")
+    beam.Name = "HoopsLine"
+    beam.Attachment0 = attachA
+    beam.Attachment1 = attachB
+    beam.FaceCamera = true
+    beam.Segments = 1
+    beam.LightEmission = 1
+    beam.TextureSpeed = 0
+    beam.Transparency = NumberSequence.new(0)
+    beam.Color = ColorSequence.new(Config.LineColor)
+    beam.Width0 = Config.LineThickness
+    beam.Width1 = Config.LineThickness
+    beam.Enabled = false
+    beam.Parent = visuals
+
+    Line.Beam = beam
+    Line.AttachPlayer = attachA
+    Line.AttachHoop = attachB
+end
+
+local function updateLine()
+    ensureLine()
+
+    local root = getRoot()
+    local hoop = State.Hoop
+
+    local canDraw = State.DrawLine
+        and root and root.Parent
+        and hoop and hoop.Parent
+
+    if not canDraw then
+        Line.Beam.Enabled = false
+        return
+    end
+
+    if Line.AttachPlayer.Parent ~= root then
+        Line.AttachPlayer.Parent = root
+        Line.AttachPlayer.Position = Vector3.new(0, 0, 0)
+    end
+    if Line.AttachHoop.Parent ~= hoop then
+        Line.AttachHoop.Parent = hoop
+        Line.AttachHoop.Position = Vector3.new(0, 0, 0)
+    end
+
+    Line.Beam.Color = ColorSequence.new(Config.LineColor)
+    Line.Beam.Width0 = Config.LineThickness
+    Line.Beam.Width1 = Config.LineThickness
+    Line.Beam.Enabled = true
+end
+
+--------------------------------------------------------------------------------
+-- ball guidance: drive it straight down the line to the rim
+--------------------------------------------------------------------------------
+
+local function guideBall()
+    local ball = State.Ball
+    local hoop = State.Hoop
+    if not (State.FollowLine and ball and ball.Parent and hoop and hoop.Parent) then
+        return
+    end
+    if isHeld(ball) then
+        return
+    end
+
+    local target = hoop.Position
+    local toTarget = target - ball.Position
+    local dist = toTarget.Magnitude
+    if dist < Config.ShootRange then
+        return -- arrived, stop nudging so the game's own physics finishes it
+    end
+
+    ball.AssemblyLinearVelocity = toTarget.Unit * Config.ShotSpeed
+end
+
+local function launchToHoop()
+    local ball = State.Ball
+    local hoop = State.Hoop
+    if not (ball and ball.Parent and hoop and hoop.Parent) then
+        return
+    end
+    local toTarget = hoop.Position - ball.Position
+    if toTarget.Magnitude > 0.1 then
+        ball.AssemblyLinearVelocity = toTarget.Unit * Config.ShotSpeed
+    end
+end
+
+--------------------------------------------------------------------------------
+-- aimbot: point the camera at the sweet spot above the rim
+--------------------------------------------------------------------------------
+
+local AimMarker -- small neon ball sitting on the aim point
+
+-- hoopz shot meter hook. Return 0..100 of current shot power, or nil if the
+-- meter isn't on screen. Left as a stub until the meter path for hoopz is known.
+local function readShotPower()
+    -- local gui = LocalPlayer:FindFirstChild("PlayerGui")
+    -- local meter = gui and gui:FindFirstChild("ShotMeter", true)
+    -- if meter then
+    --     return meter.Fill.AbsoluteSize.X / meter.Back.AbsoluteSize.X * 100
+    -- end
+    return nil
+end
+
+local function getAimPoint()
+    local hoop = State.Hoop
+    if not (hoop and hoop.Parent) then
+        return nil
+    end
+    return hoop.Position + Vector3.new(0, Config.ArcHeight, 0)
+end
+
+local function aimDistance()
+    local root = getRoot()
+    local hoop = State.Hoop
+    if not (root and hoop and hoop.Parent) then
+        return math.huge
+    end
+    return (root.Position - hoop.Position).Magnitude
+end
+
+local function inAimRange()
+    return aimDistance() <= Config.AimRange
+end
+
+local function ensureMarker()
+    if AimMarker and AimMarker.Parent then
+        return
+    end
+
+    local part = Instance.new("Part")
+    part.Name = "HoopsAimPoint"
+    part.Shape = Enum.PartType.Ball
+    part.Size = Vector3.new(0.6, 0.6, 0.6)
+    part.Anchored = true
+    part.CanCollide = false
+    part.CanQuery = false
+    part.CanTouch = false
+    part.Material = Enum.Material.Neon
+    part.Color = Color3.fromRGB(255, 60, 60)
+    part.Transparency = 1
+    part.Parent = visuals
+
+    AimMarker = part
+end
+
+local function updateAim()
+    ensureMarker()
+
+    local aim = getAimPoint()
+    if not aim then
+        AimMarker.Transparency = 1
+        return
+    end
+
+    if not (State.Aimbot and inAimRange()) then
+        AimMarker.Transparency = 1
+        return
+    end
+
+    AimMarker.Position = aim
+    AimMarker.Transparency = 0.15
+
+    local cam = Workspace.CurrentCamera
+    if not cam then
+        return
+    end
+
+    local pos = cam.CFrame.Position
+    if (pos - aim).Magnitude < 0.1 then
+        return -- degenerate lookAt, skip this frame
+    end
+
+    local target = CFrame.lookAt(pos, aim)
+    cam.CFrame = Config.AimSmooth >= 1 and target or cam.CFrame:Lerp(target, Config.AimSmooth)
+end
+
+local function getShotTool()
+    local char = LocalPlayer.Character
+    return char and char:FindFirstChildOfClass("Tool")
+end
+
+local function autoRelease()
+    if not (State.Aimbot and State.AutoRelease and inAimRange()) then
+        return
+    end
+
+    local now = os.clock()
+    if State.LastRelease and now - State.LastRelease < Config.ReleaseCooldown then
+        return
+    end
+
+    -- gate on the meter when we can read it, otherwise release on engage
+    local power = readShotPower()
+    if power and power < Config.PowerTarget then
+        return
+    end
+
+    local tool = getShotTool()
+    if tool then
+        tool:Activate()
+        State.LastRelease = now
+    end
+end
+
+--------------------------------------------------------------------------------
+-- main loop
+--------------------------------------------------------------------------------
+
+RunService.RenderStepped:Connect(function()
+    updateLine()
+    updateAim()
+    autoRelease()
+    guideBall()
+end)
+
+local StatusLabel -- live court / ball readout, assigned in the UI section
+
+-- re-scan targets on a slow loop so court moves / respawns get picked up
+task.spawn(function()
+    while task.wait(Config.RefreshRate) do
+        local court, hoop = nearestCourt()
+        State.Court = court
+        State.Hoop = hoop
+        refreshBall(court)
+
+        if StatusLabel then
+            StatusLabel:SetText(string.format("Court: %s  |  Ball: %s",
+                court and court.Name or "-",
+                State.Ball and State.Ball.Name or "-"))
+        end
+    end
+end)
+
+--------------------------------------------------------------------------------
+-- UI
+--------------------------------------------------------------------------------
+
+local Window = Library:Window({
+    Name = "Hoops",
+    SubName = "line + guided trajectory",
+    Logo = "120959262762131",
+})
+
+local KeybindList = Library:KeybindList("hoops")
+
+Window:Category("Aim")
+
+local MainPage = Window:Page({ Name = "Main", Icon = "100050851789190", Columns = 2 })
+
+local LineSection = MainPage:Section({
+    Name = "Aim Line",
+    Description = "connect player to hoop",
+    Icon = "123944728972740",
+    Side = 1,
+})
+
+LineSection:Toggle({
+    Name = "Draw Player -> Hoop Line",
+    Flag = "DrawLine",
+    Default = false,
+    Callback = function(Value)
+        State.DrawLine = Value
+    end,
+})
+
+LineSection:Label("Line Color"):Colorpicker({
+    Name = "Line Color",
+    Flag = "LineColor",
+    Default = Config.LineColor,
+    Callback = function(Color)
+        Config.LineColor = Color
+    end,
+})
+
+LineSection:Slider({
+    Name = "Line Thickness",
+    Flag = "LineThickness",
+    Min = 0.05,
+    Max = 1,
+    Default = Config.LineThickness,
+    Decimals = 2,
+    Suffix = "st",
+    Callback = function(Value)
+        Config.LineThickness = Value
+    end,
+})
+
+local BallSection = MainPage:Section({
+    Name = "Trajectory",
+    Description = "ball rides the line",
+    Icon = "123944728972740",
+    Side = 2,
+})
+
+BallSection:Toggle({
+    Name = "Ball Follow Line",
+    Flag = "FollowLine",
+    Default = false,
+    Callback = function(Value)
+        State.FollowLine = Value
+        if Value then
+            Library:Notification({
+                Title = "Trajectory on",
+                Description = "ball is pulled down the line to the rim",
+                Duration = 4,
+                Icon = "73789337996373",
+            })
+        end
+    end,
+})
+
+BallSection:Slider({
+    Name = "Shot Speed",
+    Flag = "ShotSpeed",
+    Min = 40,
+    Max = 300,
+    Default = Config.ShotSpeed,
+    Decimals = 0,
+    Suffix = "st/s",
+    Callback = function(Value)
+        Config.ShotSpeed = Value
+    end,
+})
+
+BallSection:Button({
+    Name = "Launch to Hoop",
+    Callback = function()
+        launchToHoop()
+    end,
+})
+
+BallSection:Keybind({
+    Name = "Launch Key",
+    Flag = "LaunchKey",
+    Default = Enum.KeyCode.E,
+    Callback = function()
+        launchToHoop()
+    end,
+})
+
+Window:Category("Aimbot")
+
+local AimPage = Window:Page({ Name = "Aimbot", Icon = "108839695397679", Columns = 1 })
+
+local AimSection = AimPage:Section({
+    Name = "Camera Lock",
+    Description = "lock onto the sweet spot above the rim",
+    Icon = "123944728972740",
+    Side = 1,
+})
+
+AimSection:Toggle({
+    Name = "Aimbot (camera lock)",
+    Flag = "Aimbot",
+    Default = false,
+    Callback = function(Value)
+        State.Aimbot = Value
+    end,
+})
+
+AimSection:Toggle({
+    Name = "Auto Release (85)",
+    Flag = "AutoRelease",
+    Default = false,
+    Callback = function(Value)
+        State.AutoRelease = Value
+    end,
+})
+
+AimSection:Slider({
+    Name = "Arc Height (above rim)",
+    Flag = "ArcHeight",
+    Min = 2,
+    Max = 20,
+    Default = Config.ArcHeight,
+    Decimals = 1,
+    Suffix = "st",
+    Callback = function(Value)
+        Config.ArcHeight = Value
+    end,
+})
+
+AimSection:Slider({
+    Name = "Aim Range",
+    Flag = "AimRange",
+    Min = 10,
+    Max = 120,
+    Default = Config.AimRange,
+    Decimals = 0,
+    Suffix = "st",
+    Callback = function(Value)
+        Config.AimRange = Value
+    end,
+})
+
+AimSection:Slider({
+    Name = "Power Target",
+    Flag = "PowerTarget",
+    Min = 50,
+    Max = 100,
+    Default = Config.PowerTarget,
+    Decimals = 0,
+    Suffix = "%",
+    Callback = function(Value)
+        Config.PowerTarget = Value
+    end,
+})
+
+AimSection:Slider({
+    Name = "Aim Smoothing",
+    Flag = "AimSmooth",
+    Min = 0.05,
+    Max = 1,
+    Default = Config.AimSmooth,
+    Decimals = 2,
+    Suffix = "",
+    Callback = function(Value)
+        Config.AimSmooth = Value
+    end,
+})
+
+AimSection:Keybind({
+    Name = "Aimbot Key",
+    Flag = "AimbotKey",
+    Default = Enum.KeyCode.Q,
+    Callback = function()
+        State.Aimbot = not State.Aimbot
+    end,
+})
+
+Window:Category("Settings")
+
+local SettingsPage = Window:Page({ Name = "Config", Icon = "122669828593160" })
+
+local Filters = SettingsPage:Section({
+    Name = "Detection",
+    Description = "what counts as hoop / ball",
+    Icon = "103180437044643",
+    Side = 1,
+})
+
+StatusLabel = Filters:Label("Court: -  |  Ball: -")
+
+Filters:Slider({
+    Name = "Ball Lock Range",
+    Flag = "BallLockRange",
+    Min = 30,
+    Max = 500,
+    Default = Config.BallLockRange,
+    Decimals = 0,
+    Suffix = "st",
+    Callback = function(Value)
+        Config.BallLockRange = Value
+    end,
+})
+
+Filters:Label("Hoop Names (fallback)")
+Filters:Textbox({
+    Flag = "HoopNames",
+    Default = table.concat(Config.HoopNames, ","),
+    Placeholder = "rim,hoop,net",
+    Numeric = false,
+    Finished = true,
+    Callback = function(Value)
+        local list = {}
+        for name in Value:gmatch("[^,%s]+") do
+            list[#list + 1] = name:lower()
+        end
+        if #list > 0 then
+            Config.HoopNames = list
+        end
+    end,
+})
+
+Filters:Label("Ball Names (fallback)")
+Filters:Textbox({
+    Flag = "BallNames",
+    Default = table.concat(Config.BallNames, ","),
+    Placeholder = "ball,basketball",
+    Numeric = false,
+    Finished = true,
+    Callback = function(Value)
+        local list = {}
+        for name in Value:gmatch("[^,%s]+") do
+            list[#list + 1] = name:lower()
+        end
+        if #list > 0 then
+            Config.BallNames = list
+        end
+    end,
+})
+
+Filters:Label("Ball Folder (workspace.<this>)")
+Filters:Textbox({
+    Flag = "BallFolder",
+    Default = Config.BallFolder,
+    Placeholder = "Basketball",
+    Numeric = false,
+    Finished = true,
+    Callback = function(Value)
+        if Value ~= "" then
+            Config.BallFolder = Value
+        end
+    end,
+})
+
+Filters:Label("Court Value Name")
+Filters:Textbox({
+    Flag = "BallCourtValue",
+    Default = Config.BallCourtValue,
+    Placeholder = "CurrentGame",
+    Numeric = false,
+    Finished = true,
+    Callback = function(Value)
+        if Value ~= "" then
+            Config.BallCourtValue = Value
+        end
+    end,
+})
+
+Library:CreateSettingsPage(Window, KeybindList)
+
+Window:Init()
+getgenv().Library = Library
