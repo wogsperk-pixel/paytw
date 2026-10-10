@@ -4,9 +4,9 @@
     Put the raw lib URL in LIB_URL, or pre-load it and comment the loadstring out.
 ]]
 
-local LIB_URL = "PUT_LIB_URL_HERE" -- FILL: your lyap lib raw url
+local LIB_URL = "loadstring(game:HttpGet("https://raw.githubusercontent.com/wogsperk-pixel/paytw/refs/heads/main/uilib"))()" -- FILL: your lyap lib raw url
 
-local Library = LIB_URL ~= "PUT_LIB_URL_HERE" and loadstring(game:HttpGet(LIB_URL))() or getgenv().Library
+local Library = LIB_URL ~= "loadstring(game:HttpGet("https://raw.githubusercontent.com/wogsperk-pixel/paytw/refs/heads/main/uilib"))()" and loadstring(game:HttpGet(LIB_URL))() or getgenv().Library
 assert(Library, "Library not loaded — set LIB_URL or pre-load it into getgenv().Library")
 
 local Players = game:GetService("Players")
